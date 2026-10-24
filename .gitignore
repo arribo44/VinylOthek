@@ -37,3 +37,4 @@ vinylothek.db
 
 # Réglages Claude Code locaux
 .claude/settings.local.json
+*.db.bak*
