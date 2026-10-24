@@ -670,79 +670,271 @@ function AddModal({ album, onAdd, onCancel }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // ONGLET COLLECTION
 // ══════════════════════════════════════════════════════════════════════════════
+// État mémorisé dans le navigateur : conservé entre les onglets et après rechargement
+function usePersistentState(key, initial) {
+  const [value, setValue] = useState(() => {
+    try {
+      const saved = localStorage.getItem(key);
+      return saved !== null ? JSON.parse(saved) : initial;
+    } catch {
+      return initial;
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* stockage indisponible */ }
+  }, [key, value]);
+  return [value, setValue];
+}
+
+// Minuscules et sans accents, pour une recherche tolérante
+function fold(s) {
+  return String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+}
+
+function decadeOf(year) {
+  const y = parseInt(year, 10);
+  return Number.isFinite(y) ? Math.floor(y / 10) * 10 : null;
+}
+
+function decadeLabel(d) {
+  return `${String(d).slice(2)}s`;
+}
+
+function toggleIn(list, item) {
+  return list.includes(item) ? list.filter(x => x !== item) : [...list, item];
+}
+
+const SORTS = [
+  { key: "date",   label: "Ajout récent", dir: "desc" },
+  { key: "artist", label: "Artiste",      dir: "asc"  },
+  { key: "title",  label: "Titre",        dir: "asc"  },
+  { key: "year",   label: "Année",        dir: "desc" },
+  { key: "rating", label: "Note",         dir: "desc" },
+];
+
+const TOP_GENRES = 10;
+
+function Chip({ active, onClick, children, title }) {
+  return (
+    <button onClick={onClick} title={title} style={{
+      background: active ? "#f5a623" : "#161616",
+      border: `1px solid ${active ? "#f5a623" : "#262626"}`,
+      borderRadius: 20, padding: "6px 12px",
+      color: active ? "#0d0d0d" : "#aaa",
+      fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", flexShrink: 0,
+    }}>{children}</button>
+  );
+}
+
+function ChipCount({ n }) {
+  return <span style={{ marginLeft: 5, opacity: .6, fontWeight: 400 }}>{n}</span>;
+}
+
+function GenrePicker({ genreCounts, selected, onToggle, onClose }) {
+  const [q, setQ] = useState("");
+  const shown = genreCounts.filter(([g]) => fold(g).includes(fold(q)));
+
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,.8)", zIndex: 300,
+      display: "flex", alignItems: "flex-end", justifyContent: "center",
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: "#141414", width: "100%", maxWidth: 480, maxHeight: "80vh",
+        borderRadius: "16px 16px 0 0", border: "1px solid #242424",
+        display: "flex", flexDirection: "column",
+      }}>
+        <div style={{ padding: "16px 16px 10px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 16 }}>Genres</div>
+            <button onClick={onClose} style={{
+              background: "#f5a623", border: "none", borderRadius: 10,
+              padding: "7px 16px", color: "#0d0d0d", fontWeight: 700, fontSize: 13,
+            }}>Terminé</button>
+          </div>
+          <input
+            autoFocus value={q} onChange={e => setQ(e.target.value)}
+            placeholder={`Chercher parmi ${genreCounts.length} genres…`}
+            style={{
+              width: "100%", background: "#0d0d0d", border: "1px solid #2a2a2a",
+              borderRadius: 10, padding: "10px 12px", color: "#f0ece4", fontSize: 14,
+            }}
+          />
+        </div>
+        <div style={{ overflowY: "auto", padding: "0 16px 16px" }}>
+          {shown.map(([g, n]) => (
+            <label key={g} style={{
+              display: "flex", alignItems: "center", gap: 10,
+              padding: "9px 0", borderBottom: "1px solid #1c1c1c", fontSize: 14, cursor: "pointer",
+            }}>
+              <input type="checkbox" checked={selected.includes(g)} onChange={() => onToggle(g)}
+                style={{ accentColor: "#f5a623", width: 16, height: 16 }} />
+              <span style={{ flex: 1 }}>{g}</span>
+              <span style={{ color: "#555", fontSize: 12 }}>{n}</span>
+            </label>
+          ))}
+          {shown.length === 0 && (
+            <div style={{ color: "#555", fontSize: 13, padding: "16px 0", textAlign: "center" }}>Aucun genre.</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CollectionTab({ collection, loading, onUpdate, onRemove }) {
-  const [q,           setQ]           = useState("");
-  const [genreFilter, setGenreFilter] = useState("");
-  const [sortBy,      setSortBy]      = useState("date");
-  const [selected,    setSelected]    = useState(null);
+  const [q,        setQ]        = usePersistentState("vt_q", "");
+  const [genres,   setGenres]   = usePersistentState("vt_genres", []);
+  const [decades,  setDecades]  = usePersistentState("vt_decades", []);
+  const [unrated,  setUnrated]  = usePersistentState("vt_unrated", false);
+  const [sort,     setSort]     = usePersistentState("vt_sort", { key: "date", dir: "desc" });
+  const [selected, setSelected] = useState(null);
+  const [picker,   setPicker]   = useState(false);
 
-  const genres = Array.from(new Set(collection.flatMap(a => a.genres || []))).sort();
+  // Genres triés par nombre d'albums ; les genres sélectionnés restent toujours visibles
+  const countMap = {};
+  collection.forEach(a => (a.genres || []).forEach(g => { countMap[g] = (countMap[g] || 0) + 1; }));
+  const genreCounts = Object.entries(countMap).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const topGenres = genreCounts.slice(0, TOP_GENRES).map(([g]) => g);
+  const visibleGenres = [...genres.filter(g => !topGenres.includes(g)), ...topGenres];
 
-  const filtered = collection.filter(a => {
-    const s = q.toLowerCase();
-    const matchesText = !s
-      || a.title?.toLowerCase().includes(s)
-      || a.artist?.toLowerCase().includes(s)
-      || String(a.year || '').toLowerCase().includes(s)
-      || (a.genres || []).some(g => g.toLowerCase().includes(s));
+  const decadeCounts = {};
+  collection.forEach(a => { const d = decadeOf(a.year); if (d) decadeCounts[d] = (decadeCounts[d] || 0) + 1; });
+  const allDecades = Object.keys(decadeCounts).map(Number).sort((a, b) => a - b);
+  const unratedCount = collection.filter(a => !a.rating).length;
 
-    const matchesGenre = !genreFilter || (a.genres || []).includes(genreFilter);
-    return matchesText && matchesGenre;
-  });
+  const s = fold(q.trim());
+  const filtered = collection.filter(a =>
+    (!s || fold(a.title).includes(s) || fold(a.artist).includes(s))
+    && (!genres.length  || (a.genres || []).some(g => genres.includes(g)))
+    && (!decades.length || decades.includes(decadeOf(a.year)))
+    && (!unrated || !a.rating)
+  );
 
+  // Tri ; les albums sans année / sans note vont toujours à la fin
+  const order = new Map(collection.map((a, i) => [a.id, i]));
+  const sign = sort.dir === "asc" ? 1 : -1;
+  const byText = (x, y) => (x || "").localeCompare(y || "", "fr", { sensitivity: "base" });
   const sorted = [...filtered].sort((a, b) => {
-    if (sortBy === "artist") return (a.artist || "").localeCompare(b.artist || "");
-    if (sortBy === "year")   return (Number(b.year) || -Infinity) - (Number(a.year) || -Infinity);
-    if (sortBy === "rating") return (b.rating || 0) - (a.rating || 0);
-    return 0;
+    switch (sort.key) {
+      case "artist": return sign * byText(a.artist, b.artist) || byText(a.title, b.title);
+      case "title":  return sign * byText(a.title, b.title);
+      case "year": {
+        const ya = parseInt(a.year, 10), yb = parseInt(b.year, 10);
+        if (!ya || !yb) return (!ya) - (!yb);
+        return sign * (ya - yb) || byText(a.artist, b.artist);
+      }
+      case "rating":
+        if (!a.rating || !b.rating) return (!a.rating) - (!b.rating);
+        return sign * (a.rating - b.rating) || byText(a.artist, b.artist);
+      default:
+        // La collection arrive de la plus récente à la plus ancienne
+        return -sign * (order.get(a.id) - order.get(b.id));
+    }
   });
+
+  const activeFilters = [
+    ...(s ? [`« ${q.trim()} »`] : []),
+    ...(genres.length ? [genres.join(" ou ")] : []),
+    ...(decades.length ? [[...decades].sort().map(decadeLabel).join(" ou ")] : []),
+    ...(unrated ? ["non notés"] : []),
+  ];
+  const clearFilters = () => { setQ(""); setGenres([]); setDecades([]); setUnrated(false); };
+
+  const changeSort = (key) => {
+    const def = SORTS.find(x => x.key === key);
+    setSort({ key, dir: def.dir });
+  };
+  const flipSort = () => setSort(prev => ({ ...prev, dir: prev.dir === "asc" ? "desc" : "asc" }));
 
   if (loading) return <Spinner />;
 
+  const rowStyle = { display: "flex", gap: 6, marginBottom: 10 };
+
   return (
     <div style={{ padding: "16px 16px 0" }}>
-      <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+      {/* Recherche texte */}
+      <div style={{ position: "relative", marginBottom: 12 }}>
         <input
           value={q} onChange={e => setQ(e.target.value)}
-          placeholder="Filtrer par titre, artiste, année, genre…"
+          placeholder="Rechercher un titre ou un artiste…"
           style={{
-            flex: 1, minWidth: 0, background: "#161616", border: "1px solid #242424",
-            borderRadius: 12, padding: "12px 16px", color: "#f0ece4",
-            fontSize: 15,
+            width: "100%", background: "#161616", border: "1px solid #242424",
+            borderRadius: 12, padding: "12px 40px 12px 16px", color: "#f0ece4", fontSize: 15,
           }}
         />
-        <select
-          value={genreFilter}
-          onChange={e => setGenreFilter(e.target.value)}
-          style={{
-            minWidth: 140, background: "#161616", border: "1px solid #242424",
-            borderRadius: 12, padding: "12px 14px", color: "#f0ece4",
-            fontSize: 15,
-          }}
-        >
-          <option value="" style={{ color: "#999" }}>Filtrer par genre</option>
-          {genres.map((genre) => (
-            <option key={genre} value={genre}>{genre}</option>
-          ))}
-        </select>
+        {q && (
+          <button onClick={() => setQ("")} aria-label="Vider la recherche" style={{
+            position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+            background: "#2a2a2a", border: "none", borderRadius: "50%",
+            width: 24, height: 24, color: "#ccc", fontSize: 14, lineHeight: "24px", padding: 0,
+          }}>×</button>
+        )}
       </div>
 
-      <div style={{ display: "flex", gap: 6, marginBottom: 18, overflowX: "auto", paddingBottom: 2 }}>
-        {[["date","Récent"],["artist","Artiste"],["year","Année"],["rating","Note"]].map(([k, l]) => (
-          <button key={k} onClick={() => setSortBy(k)} style={{
-            background: sortBy === k ? "#f5a623" : "#161616",
-            border: "none", borderRadius: 20, padding: "6px 14px",
-            color: sortBy === k ? "#0d0d0d" : "#555",
-            fontSize: 12, fontWeight: 600, whiteSpace: "nowrap",
-          }}>{l}</button>
+      {/* Genres */}
+      {genreCounts.length > 0 && (
+        <div style={{ ...rowStyle, overflowX: "auto", paddingBottom: 2 }}>
+          <Chip active={false} onClick={() => setPicker(true)} title="Voir tous les genres">
+            ☰ Tous les genres{genres.length > 0 && ` (${genres.length})`}
+          </Chip>
+          {visibleGenres.map(g => (
+            <Chip key={g} active={genres.includes(g)} onClick={() => setGenres(toggleIn(genres, g))}>
+              {g}<ChipCount n={countMap[g] || 0} />
+            </Chip>
+          ))}
+        </div>
+      )}
+
+      {/* Décennies + non noté */}
+      <div style={{ ...rowStyle, flexWrap: "wrap" }}>
+        {allDecades.map(d => (
+          <Chip key={d} active={decades.includes(d)} onClick={() => setDecades(toggleIn(decades, d))}>
+            {decadeLabel(d)}<ChipCount n={decadeCounts[d]} />
+          </Chip>
         ))}
+        <Chip active={unrated} onClick={() => setUnrated(!unrated)}>
+          ☆ Non noté<ChipCount n={unratedCount} />
+        </Chip>
+      </div>
+
+      {/* État + tri */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+        padding: "10px 0", marginBottom: 6, borderTop: "1px solid #191919", borderBottom: "1px solid #191919",
+      }}>
+        <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: "#888", lineHeight: 1.5 }}>
+          <span style={{ color: "#f0ece4", fontWeight: 600 }}>
+            {sorted.length} album{sorted.length !== 1 ? "s" : ""}
+          </span>
+          {activeFilters.length > 0 && <> · {activeFilters.join(" · ")}</>}
+          {activeFilters.length > 0 && (
+            <button onClick={clearFilters} style={{
+              background: "none", border: "none", padding: 0, marginLeft: 8,
+              color: "#f5a623", fontSize: 12, fontWeight: 600, textDecoration: "underline",
+            }}>Effacer filtres</button>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <select value={sort.key} onChange={e => changeSort(e.target.value)} aria-label="Trier par" style={{
+            background: "#161616", border: "1px solid #262626", borderRadius: 8,
+            padding: "6px 8px", color: "#f0ece4", fontSize: 12,
+          }}>
+            {SORTS.map(o => <option key={o.key} value={o.key}>Trier : {o.label}</option>)}
+          </select>
+          <button onClick={flipSort} title={sort.dir === "asc" ? "Ordre croissant" : "Ordre décroissant"}
+            aria-label="Inverser l'ordre" style={{
+              background: "#161616", border: "1px solid #262626", borderRadius: 8,
+              width: 30, height: 30, color: "#f5a623", fontSize: 14, padding: 0,
+            }}>{sort.dir === "asc" ? "↑" : "↓"}</button>
+        </div>
       </div>
 
       {sorted.length === 0 && (
         <div style={{ textAlign: "center", color: "#555", marginTop: 60, fontSize: 14, lineHeight: 2, whiteSpace: "pre-line" }}>
           {collection.length === 0
             ? "Ta collection est vide.\nCherche des albums pour commencer !"
-            : "Aucun résultat."}
+            : "Aucun album ne correspond à ces filtres."}
         </div>
       )}
 
@@ -751,6 +943,15 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
           <CollectionCard album={album} onOpen={() => setSelected(album)} />
         </div>
       ))}
+
+      {picker && (
+        <GenrePicker
+          genreCounts={genreCounts}
+          selected={genres}
+          onToggle={g => setGenres(prev => toggleIn(prev, g))}
+          onClose={() => setPicker(false)}
+        />
+      )}
 
       {selected && (
         <CollectionDetailModal
