@@ -482,6 +482,14 @@ function WikidataP2723Button({ qid, deezerUrl, onSuccess }) {
   );
 }
 
+function DeezerSearchNote() {
+  return (
+    <div style={{ textAlign: "center", color: "#555", fontSize: 12, marginTop: 10 }}>
+      Lien trouvé par recherche sur Deezer : vérifie que c&apos;est le bon album avant de l&apos;ajouter sur Wikidata.
+    </div>
+  );
+}
+
 function DetailModal({ album, inCollection, onAdd, onClose }) {
   return (
     <div style={{
@@ -577,10 +585,12 @@ function DetailModal({ album, inCollection, onAdd, onClose }) {
           </div>
 
           {!album.deezer_url && (
-            <div style={{ textAlign: "center", color: "#333", fontSize: 12, marginTop: 10 }}>
-              Pas de lien Deezer référencé sur MusicBrainz pour cet album
+            <div style={{ textAlign: "center", color: "#555", fontSize: 12, marginTop: 10 }}>
+              Album introuvable sur Deezer
             </div>
           )}
+
+          {album.deezer_found_by_search && <DeezerSearchNote />}
 
           {album.deezer_url && album.wikidata_id && (
             <WikidataP2723Button qid={album.wikidata_id} deezerUrl={album.deezer_url} />
@@ -777,7 +787,18 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
   const [fetchError, setFetchError] = useState(null);
   const [fetching, setFetching] = useState(false);
 
-  const deezerUrl = album.deezer_url || (album.wikidata_deezer_id ? `https://www.deezer.com/album/${album.wikidata_deezer_id}` : null);
+  const knownDeezerUrl = album.deezer_url || (album.wikidata_deezer_id ? `https://www.deezer.com/album/${album.wikidata_deezer_id}` : null);
+  const [searchedDeezerUrl, setSearchedDeezerUrl] = useState(null);
+  const deezerUrl = knownDeezerUrl || searchedDeezerUrl;
+
+  // Pas de lien connu : recherche sur Deezer (résultat mis en cache par le proxy)
+  useEffect(() => {
+    if (knownDeezerUrl || !album.artist || !album.title) return;
+    const params = new URLSearchParams({ artist: album.artist, title: album.title });
+    apiGet(`/deezer/search?${params}`)
+      .then(d => setSearchedDeezerUrl(d.url))
+      .catch(() => {});
+  }, [knownDeezerUrl, album.artist, album.title]);
   const canFetchMissing = album.id && (!album.tracks?.length || (!album.units_sold && !album.work_language));
 
   const fetchMissingDetails = async () => {
@@ -939,6 +960,8 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
             display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
           }}>🎧 Écouter sur Deezer</button>
         )}
+
+        {!knownDeezerUrl && searchedDeezerUrl && <DeezerSearchNote />}
 
         {deezerUrl && album.wikidata_id && (
           <WikidataP2723Button

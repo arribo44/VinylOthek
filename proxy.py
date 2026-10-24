@@ -12,6 +12,8 @@ import os
 import re
 import time
 import threading
+import unicodedata
+from typing import Any
 from flask import Flask, request, jsonify
 import requests
 
@@ -105,8 +107,8 @@ def init_db():
 # Les réponses vides (pas de pochette, pas de note…) sont aussi gardées pour ne
 # pas redemander ce qui n'existe pas. Les erreurs réseau, elles, ne sont jamais
 # mises en cache. ?refresh=1 force un nouvel appel.
-DAY        = 86400
-CACHE_MISS = object()
+DAY             = 86400
+CACHE_MISS: Any = object()
 
 def cache_get(key, max_age=None):
     with get_db() as conn:
@@ -221,6 +223,53 @@ def discogs_rating_cached(artist, title, refresh=False):
     return rating
 
 
+# ── Helper Deezer (API publique, sans clé) ───────────────────────────────────
+DEEZER_API = "https://api.deezer.com"
+
+def normalize(s):
+    """Minuscules, sans accents, sans mentions entre parenthèses (Remastered, Deluxe…)."""
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[\(\[].*?[\)\]]", "", s)
+    s = re.sub(r"\b(deluxe|remaster(ed)?|edition|version|expanded)\b", "", s)
+    s = re.sub(r"^the\s+", "", s)
+    s = s.replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+def deezer_search_album(artist, title):
+    """Cherche l'album sur Deezer ; ne renvoie un lien que si l'artiste et le
+    titre correspondent (lève une exception en cas d'erreur réseau)."""
+    r = requests.get(f"{DEEZER_API}/search/album", params={
+        "q": f'artist:"{artist}" album:"{title}"', "limit": 10,
+    }, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", "Erreur Deezer"))
+    want_artist, want_title = normalize(artist), normalize(title)
+    for a in data.get("data", []):
+        if normalize(a.get("artist", {}).get("name")) == want_artist \
+                and normalize(a.get("title")) == want_title:
+            return a.get("link")
+    return None
+
+def deezer_url_cached(artist, title, refresh=False):
+    """Lien Deezer trouvé par recherche, mis en cache 30 jours (y compris « rien trouvé »)."""
+    if not artist or not title:
+        return None
+    key = f"deezer:{artist}|{title}".lower()
+    if not refresh:
+        hit = cache_get(key, 30 * DAY)
+        if hit is not CACHE_MISS:
+            return hit
+    try:
+        url = deezer_search_album(artist, title)
+    except Exception as e:
+        print(f"[Deezer] Erreur pour {artist} - {title}: {e}")
+        return None
+    cache_set(key, url)
+    return url
+
+
 def wikidata_get_album_info(qid):
     if not qid or not QID_RE.match(qid):
         return {}
@@ -307,7 +356,21 @@ def album_detail(mbid):
         if complete:
             cache_set(key, album)
     album["discogs_rating"] = discogs_rating_cached(album["artist"], album["title"], refresh)
+    # Ni MusicBrainz ni Wikidata n'ont de lien Deezer : on cherche sur Deezer
+    album["deezer_found_by_search"] = False
+    if not album.get("deezer_url"):
+        album["deezer_url"] = deezer_url_cached(album["artist"], album["title"], refresh)
+        album["deezer_found_by_search"] = bool(album["deezer_url"])
     return jsonify(album)
+
+
+@app.route("/deezer/search")
+def deezer_search():
+    artist = request.args.get("artist", "").strip()
+    title  = request.args.get("title", "").strip()
+    if not artist or not title:
+        return jsonify({"error": "Paramètres artist et title requis"}), 400
+    return jsonify({"url": deezer_url_cached(artist, title, wants_refresh())})
 
 
 def fetch_album_detail(mbid):
