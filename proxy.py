@@ -91,8 +91,40 @@ def init_db():
                 conn.execute(f"ALTER TABLE albums ADD COLUMN {column}")
             except Exception:
                 pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS api_cache (
+                key        TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                fetched_at REAL NOT NULL
+            )
+        """)
         conn.commit()
     print(f"[DB] Base SQLite : {DB_PATH}")
+
+# ── Cache des appels API ──────────────────────────────────────────────────────
+# Les réponses vides (pas de pochette, pas de note…) sont aussi gardées pour ne
+# pas redemander ce qui n'existe pas. Les erreurs réseau, elles, ne sont jamais
+# mises en cache. ?refresh=1 force un nouvel appel.
+DAY        = 86400
+CACHE_MISS = object()
+
+def cache_get(key, max_age=None):
+    with get_db() as conn:
+        row = conn.execute("SELECT data, fetched_at FROM api_cache WHERE key = ?", (key,)).fetchone()
+    if not row or (max_age and time.time() - row["fetched_at"] > max_age):
+        return CACHE_MISS
+    return json.loads(row["data"])
+
+def cache_set(key, value):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO api_cache (key, data, fetched_at) VALUES (?, ?, ?)",
+            (key, json.dumps(value), time.time()),
+        )
+        conn.commit()
+
+def wants_refresh():
+    return request.args.get("refresh") == "1"
 
 def row_to_dict(row):
     d = dict(row)
@@ -146,43 +178,47 @@ WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 
 # ── Helper Discogs ────────────────────────────────────────────────────────
 def discogs_get_rating(artist, title):
-    """Récupère la note moyenne depuis Discogs."""
+    """Récupère la note moyenne depuis Discogs (lève une exception en cas d'erreur)."""
+    # Recherche de la release
+    search_url = f"{DISCOGS_BASE}/database/search"
+    params = {
+        "artist": artist,
+        "title": title,
+        "type": "release",
+        "format": "vinyl",
+        "token": DISCOGS_TOKEN,
+    }
+    r = requests.get(search_url, params=params, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    results = r.json().get("results", [])
+    if not results:
+        return None
+
+    # Récupérer les détails du premier résultat
+    detail_url = f"{DISCOGS_BASE}/releases/{results[0]['id']}"
+    r2 = requests.get(detail_url, params={"token": DISCOGS_TOKEN}, headers=HEADERS, timeout=10)
+    r2.raise_for_status()
+
+    rating = r2.json().get("community", {}).get("rating", {}).get("average")
+    return float(rating) if rating else None
+
+
+def discogs_rating_cached(artist, title, refresh=False):
+    """Note Discogs, mise en cache 30 jours (elle évolue avec les votes)."""
     if not DISCOGS_TOKEN or not artist or not title:
         return None
+    key = f"discogs:{artist}|{title}".lower()
+    if not refresh:
+        hit = cache_get(key, 30 * DAY)
+        if hit is not CACHE_MISS:
+            return hit
     try:
-        # Recherche de la release
-        search_url = f"{DISCOGS_BASE}/database/search"
-        params = {
-            "artist": artist,
-            "title": title,
-            "type": "release",
-            "format": "vinyl",
-            "token": DISCOGS_TOKEN,
-        }
-        r = requests.get(search_url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results", [])
-        if not results:
-            return None
-
-        # Prendre le premier résultat pertinent
-        release_id = results[0]["id"]
-
-        # Récupérer les détails de la release
-        detail_url = f"{DISCOGS_BASE}/releases/{release_id}"
-        r2 = requests.get(detail_url, params={"token": DISCOGS_TOKEN}, headers=HEADERS, timeout=10)
-        r2.raise_for_status()
-        detail = r2.json()
-
-        rating = detail.get("community", {}).get("rating", {}).get("average")
-        return float(rating) if rating else None
-    except requests.exceptions.RequestException as e:
+        rating = discogs_get_rating(artist, title)
+    except Exception as e:
         print(f"[Discogs] Erreur pour {artist} - {title}: {e}")
         return None
-    except Exception as e:
-        print(f"[Discogs] Erreur inattendue: {e}")
-        return None
+    cache_set(key, rating)
+    return rating
 
 
 def wikidata_get_album_info(qid):
@@ -208,6 +244,7 @@ def wikidata_get_album_info(qid):
         results = r.json().get("results", {}).get("bindings", [])
         if not results:
             return {}
+        # None = erreur (à ne pas mettre en cache), {} = rien trouvé
         row = results[0]
         info = {
             "wikidata_deezer_id": row.get("deezerId", {}).get("value"),
@@ -218,7 +255,7 @@ def wikidata_get_album_info(qid):
         return info
     except Exception as e:
         print(f"[Wikidata] Erreur pour {qid}: {e}")
-        return {}
+        return None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MUSICBRAINZ — Recherche
@@ -228,6 +265,13 @@ def search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "Paramètre q manquant"}), 400
+
+    key = f"search:{q.lower()}"
+    if not wants_refresh():
+        hit = cache_get(key, 30 * DAY)
+        if hit is not CACHE_MISS:
+            return jsonify({"results": hit})
+
     try:
         data = mb_get("/release-group", {"query": q, "type": "album", "limit": 20})
     except Exception as e:
@@ -242,6 +286,7 @@ def search():
             "artist": artist,
             "year":   (rg.get("first-release-date") or "")[:4],
         })
+    cache_set(key, results)
     return jsonify({"results": results})
 
 
@@ -250,80 +295,99 @@ def search():
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/album/<mbid>")
 def album_detail(mbid):
-    try:
-        rg = mb_get(f"/release-group/{mbid}", {
-            "inc": "artist-credits+genres+tags+releases+url-rels",
-        })
-        artist = rg.get("artist-credit", [{}])[0].get("artist", {}).get("name", "")
-        year   = (rg.get("first-release-date") or "")[:4]
+    # Titres et métadonnées : mis en cache sans limite (ils ne changent pas)
+    refresh = wants_refresh()
+    key = f"album:{mbid}"
+    album = CACHE_MISS if refresh else cache_get(key)
+    if album is CACHE_MISS:
+        try:
+            album, complete = fetch_album_detail(mbid)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        if complete:
+            cache_set(key, album)
+    album["discogs_rating"] = discogs_rating_cached(album["artist"], album["title"], refresh)
+    return jsonify(album)
 
-        genres = [g["name"] for g in rg.get("genres", [])]
-        if not genres:
-            genres = [t["name"] for t in sorted(
-                rg.get("tags", []), key=lambda x: -x.get("count", 0)
-            )[:5]]
 
-        releases   = rg.get("releases", [])
-        tracks = []
-        duration = 0
-        deezer_url = None
-        wikidata_id = None
+def fetch_album_detail(mbid):
+    """Interroge MusicBrainz + Wikidata. Renvoie (album, complet) ; une
+    réponse incomplète (erreur sur une release ou sur Wikidata) n'est pas cachée."""
+    complete = True
+    rg = mb_get(f"/release-group/{mbid}", {
+        "inc": "artist-credits+genres+tags+releases+url-rels",
+    })
+    artist = rg.get("artist-credit", [{}])[0].get("artist", {}).get("name", "")
+    year   = (rg.get("first-release-date") or "")[:4]
 
-        for rel_url in rg.get("relations", []):
-            url_str = rel_url.get("url", {}).get("resource", "")
-            if not wikidata_id and "wikidata.org" in url_str.lower():
-                qid = url_str.rstrip("/").split("/")[-1]
-                if qid.startswith("Q"):
-                    wikidata_id = qid
-            if not deezer_url and "deezer.com" in url_str.lower():
-                deezer_url = url_str
+    genres = [g["name"] for g in rg.get("genres", [])]
+    if not genres:
+        genres = [t["name"] for t in sorted(
+            rg.get("tags", []), key=lambda x: -x.get("count", 0)
+        )[:5]]
 
-        for release in releases[:3]:  # Limiter à 3 releases max
-            try:
-                rel = mb_get(f"/release/{release.get('id')}", {"inc": "recordings+url-rels"})
-                if not tracks:
-                    for medium in rel.get("media", []):
-                        for track in medium.get("tracks", []):
-                            rec    = track.get("recording", {})
-                            dur_ms = rec.get("length") or track.get("length") or 0
-                            dur_s  = dur_ms // 1000
-                            duration += dur_s
-                            tracks.append({
-                                "position": track.get("position", len(tracks) + 1),
-                                "title":    track.get("title") or rec.get("title", ""),
-                                "duration": dur_s,
-                            })
-                for rel_url in rel.get("relations", []):
-                    url_str = rel_url.get("url", {}).get("resource", "")
-                    if not wikidata_id and "wikidata.org" in url_str.lower():
-                        qid = url_str.rstrip("/").split("/")[-1]
-                        if qid.startswith("Q"):
-                            wikidata_id = qid
-                    if not deezer_url and "deezer.com" in url_str.lower():
-                        deezer_url = url_str
-                if tracks and deezer_url and wikidata_id:
-                    break
-            except Exception as e:
-                print(f"[MB] Erreur sur release {release.get('id')}: {e}")
-                continue
+    releases   = rg.get("releases", [])
+    tracks = []
+    duration = 0
+    deezer_url = None
+    wikidata_id = None
 
-        wikidata_info = wikidata_get_album_info(wikidata_id) if wikidata_id else {}
-        deezer_url = deezer_url or (f"https://www.deezer.com/album/{wikidata_info.get('wikidata_deezer_id')}" if wikidata_info.get('wikidata_deezer_id') else None)
+    for rel_url in rg.get("relations", []):
+        url_str = rel_url.get("url", {}).get("resource", "")
+        if not wikidata_id and "wikidata.org" in url_str.lower():
+            qid = url_str.rstrip("/").split("/")[-1]
+            if qid.startswith("Q"):
+                wikidata_id = qid
+        if not deezer_url and "deezer.com" in url_str.lower():
+            deezer_url = url_str
 
-        return jsonify({
-            "id": mbid, "title": rg.get("title"),
-            "artist": artist, "year": year, "genres": genres,
-            "nb_tracks": len(tracks), "duration": duration,
-            "deezer_url": deezer_url, "tracks": tracks,
-            "wikidata_id": wikidata_id,
-            "wikidata_deezer_id": wikidata_info.get("wikidata_deezer_id"),
-            "work_language": wikidata_info.get("work_language"),
-            "review_score": wikidata_info.get("review_score"),
-            "units_sold": wikidata_info.get("units_sold"),
-            "discogs_rating": discogs_get_rating(artist, rg.get("title")),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+    for release in releases[:3]:  # Limiter à 3 releases max
+        try:
+            rel = mb_get(f"/release/{release.get('id')}", {"inc": "recordings+url-rels"})
+            if not tracks:
+                for medium in rel.get("media", []):
+                    for track in medium.get("tracks", []):
+                        rec    = track.get("recording", {})
+                        dur_ms = rec.get("length") or track.get("length") or 0
+                        dur_s  = dur_ms // 1000
+                        duration += dur_s
+                        tracks.append({
+                            "position": track.get("position", len(tracks) + 1),
+                            "title":    track.get("title") or rec.get("title", ""),
+                            "duration": dur_s,
+                        })
+            for rel_url in rel.get("relations", []):
+                url_str = rel_url.get("url", {}).get("resource", "")
+                if not wikidata_id and "wikidata.org" in url_str.lower():
+                    qid = url_str.rstrip("/").split("/")[-1]
+                    if qid.startswith("Q"):
+                        wikidata_id = qid
+                if not deezer_url and "deezer.com" in url_str.lower():
+                    deezer_url = url_str
+            if tracks and deezer_url and wikidata_id:
+                break
+        except Exception as e:
+            print(f"[MB] Erreur sur release {release.get('id')}: {e}")
+            complete = False
+            continue
+
+    wikidata_info = wikidata_get_album_info(wikidata_id) if wikidata_id else {}
+    if wikidata_info is None:
+        complete = False
+        wikidata_info = {}
+    deezer_url = deezer_url or (f"https://www.deezer.com/album/{wikidata_info.get('wikidata_deezer_id')}" if wikidata_info.get('wikidata_deezer_id') else None)
+
+    return {
+        "id": mbid, "title": rg.get("title"),
+        "artist": artist, "year": year, "genres": genres,
+        "nb_tracks": len(tracks), "duration": duration,
+        "deezer_url": deezer_url, "tracks": tracks,
+        "wikidata_id": wikidata_id,
+        "wikidata_deezer_id": wikidata_info.get("wikidata_deezer_id"),
+        "work_language": wikidata_info.get("work_language"),
+        "review_score": wikidata_info.get("review_score"),
+        "units_sold": wikidata_info.get("units_sold"),
+    }, complete
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,16 +395,25 @@ def album_detail(mbid):
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/cover/<mbid>")
 def cover(mbid):
+    # 30 jours : une pochette absente peut être ajoutée plus tard sur CAA
+    key = f"cover:{mbid}"
+    if not wants_refresh():
+        hit = cache_get(key, 30 * DAY)
+        if hit is not CACHE_MISS:
+            return jsonify({"url": hit})
     try:
         r = requests.get(
             f"{CAA_BASE}/release-group/{mbid}",
             headers=HEADERS, timeout=8, allow_redirects=True
         )
         if r.status_code == 404:
-            return jsonify({"url": None})
-        images = r.json().get("images", [])
-        front  = next((i for i in images if i.get("front")), images[0] if images else None)
-        url    = (front["thumbnails"].get("large") or front.get("image")) if front else None
+            url = None
+        else:
+            r.raise_for_status()
+            images = r.json().get("images", [])
+            front  = next((i for i in images if i.get("front")), images[0] if images else None)
+            url    = (front["thumbnails"].get("large") or front.get("image")) if front else None
+        cache_set(key, url)
         return jsonify({"url": url})
     except Exception:
         return jsonify({"url": None})

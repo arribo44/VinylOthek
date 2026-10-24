@@ -787,9 +787,10 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
       setFetchError(null);
       setFetchProgress(15);
 
-      const detail = await apiGet(`/album/${album.id}`);
+      // refresh=1 : clic explicite sur la pochette, on ignore le cache du proxy
+      const detail = await apiGet(`/album/${album.id}?refresh=1`);
       setFetchProgress(45);
-      const cover = await apiGet(`/cover/${album.id}`);
+      const cover = await apiGet(`/cover/${album.id}?refresh=1`);
       setFetchProgress(75);
 
       const patch = {
