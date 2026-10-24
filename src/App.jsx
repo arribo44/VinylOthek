@@ -203,7 +203,7 @@ export default function App() {
       return true;
     } catch (e) {
       console.error("Erreur suppression", e);
-      setToast("L'album n'a pas pu être retiré.");
+      setToast("L'album n'a pas pu être supprimé.");
       return false;
     }
   }, []);
@@ -975,9 +975,13 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
           {!confirmDel
             ? <button onClick={() => setConfirmDel(true)}
                 style={{ background: "none", border: "none", color: "#383838", fontSize: 13 }}>
-                Retirer de la collection
+                Supprimer de la collection
               </button>
-            : <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+            : <>
+              <div style={{ fontSize: 12, color: "#888", marginBottom: 12, lineHeight: 1.5 }}>
+                L&apos;album et toutes ses données (note, commentaire, titres, pochette, liens) seront effacés définitivement.
+              </div>
+              <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                 <button onClick={onRemove}
                   style={{ background: "#7b1212", border: "none", borderRadius: 10, padding: "8px 20px", color: "#fff", fontWeight: 700 }}>
                   Confirmer
@@ -987,6 +991,7 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
                   Annuler
                 </button>
               </div>
+            </>
           }
         </div>
       </div>

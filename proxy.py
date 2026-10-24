@@ -570,9 +570,24 @@ def update_album(mbid):
 
 @app.route("/collection/<mbid>", methods=["DELETE"])
 def delete_album(mbid):
-    """Supprime un album de la collection."""
+    """Supprime un album de la collection et toutes ses données en cache."""
     try:
         with get_db() as conn:
+            row = conn.execute("SELECT artist, title, wikidata_id FROM albums WHERE id = ?", (mbid,)).fetchone()
+            if not row:
+                return jsonify({"error": "Album introuvable"}), 404
+
+            # Le détail en cache peut connaître un QID absent de la table albums
+            cached = cache_get(f"album:{mbid}")
+            qids = {row["wikidata_id"], cached.get("wikidata_id") if cached is not CACHE_MISS else None}
+
+            keys = [f"album:{mbid}", f"cover:{mbid}"]
+            keys += [f"p2723:{q}" for q in qids if q]
+            if row["artist"] and row["title"]:
+                keys += [f"discogs:{row['artist']}|{row['title']}".lower(),
+                         f"deezer:{row['artist']}|{row['title']}".lower()]
+
+            conn.executemany("DELETE FROM api_cache WHERE key = ?", [(k,) for k in keys])
             conn.execute("DELETE FROM albums WHERE id = ?", (mbid,))
             conn.commit()
         return jsonify({"ok": True})
