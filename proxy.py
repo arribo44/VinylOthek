@@ -524,12 +524,20 @@ WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 def check_wikidata_p2723(qid):
     if not QID_RE.match(qid):
         return jsonify({"error": "QID invalide"}), 400
+    # 30 jours : quelqu'un d'autre peut ajouter l'ID entre-temps ; mis à jour par add-p2723
+    key = f"p2723:{qid}"
+    if not wants_refresh():
+        hit = cache_get(key, 30 * DAY)
+        if hit is not CACHE_MISS:
+            return jsonify({"exists": bool(hit), "value": hit})
     query = f"SELECT ?v WHERE {{ OPTIONAL {{ wd:{qid} wdt:P2723 ?v. }} }}"
     try:
         r = requests.get(WIKIDATA_SPARQL, params={"query": query},
                          headers={**HEADERS, "Accept": "application/sparql-results+json"}, timeout=8)
+        r.raise_for_status()
         bindings = r.json().get("results", {}).get("bindings", [])
         value = bindings[0].get("v", {}).get("value") if bindings else None
+        cache_set(key, value)
         return jsonify({"exists": bool(value), "value": value})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -576,6 +584,7 @@ def add_wikidata_p2723():
         result = r.json()
         if "error" in result:
             return jsonify({"error": result["error"].get("info", "Erreur Wikidata")}), 500
+        cache_set(f"p2723:{qid}", deezer_id)
         return jsonify({"ok": True})
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Erreur réseau : {str(e)}"}), 502
