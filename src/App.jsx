@@ -974,7 +974,10 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
         <div style={{ marginTop: 24, textAlign: "center" }}>
           {!confirmDel
             ? <button onClick={() => setConfirmDel(true)}
-                style={{ background: "none", border: "none", color: "#383838", fontSize: 13 }}>
+                style={{
+                  background: "none", border: "1px solid #5a1a1a", borderRadius: 10,
+                  padding: "8px 20px", color: "#d06060", fontSize: 13, fontWeight: 600,
+                }}>
                 Supprimer de la collection
               </button>
             : <>
