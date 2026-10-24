@@ -713,6 +713,35 @@ const SORTS = [
 ];
 
 const TOP_GENRES = 10;
+const RANDOM_COUNT = 10;
+
+// Hachage déterministe (FNV-1a) : un même tirage reste stable entre deux affichages
+function hash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+// Tire RANDOM_COUNT albums, ou un album pour chacun de RANDOM_COUNT artistes
+function pickRandom(albums, { mode, seed }) {
+  const byHash = (key) => (a, b) => hash(seed + key(a)) - hash(seed + key(b));
+  if (mode === "albums") {
+    return [...albums].sort(byHash(a => a.id)).slice(0, RANDOM_COUNT);
+  }
+  const byArtist = new Map();
+  albums.forEach(a => {
+    const k = fold(a.artist);
+    if (!byArtist.has(k)) byArtist.set(k, []);
+    byArtist.get(k).push(a);
+  });
+  return [...byArtist.keys()]
+    .sort(byHash(k => k))
+    .slice(0, RANDOM_COUNT)
+    .map(k => [...byArtist.get(k)].sort(byHash(a => a.id))[0]);
+}
 
 function Chip({ active, onClick, children, title }) {
   return (
@@ -790,6 +819,8 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
   const [sort,     setSort]     = usePersistentState("vt_sort", { key: "date", dir: "desc" });
   const [selected, setSelected] = useState(null);
   const [picker,   setPicker]   = useState(false);
+  const [random,   setRandom]   = useState(null); // { mode: "albums" | "artists", seed }
+  const newSeed = () => String(Math.random());
 
   // Genres triés par nombre d'albums ; les genres sélectionnés restent toujours visibles
   const countMap = {};
@@ -832,6 +863,9 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
         return -sign * (order.get(a.id) - order.get(b.id));
     }
   });
+
+  // En mode aléatoire, le tirage se fait parmi les albums filtrés
+  const shown = random ? pickRandom(filtered, random) : sorted;
 
   const activeFilters = [
     ...(s ? [`« ${q.trim()} »`] : []),
@@ -905,8 +939,11 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
       }}>
         <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: "#888", lineHeight: 1.5 }}>
           <span style={{ color: "#f0ece4", fontWeight: 600 }}>
-            {sorted.length} album{sorted.length !== 1 ? "s" : ""}
+            {random
+              ? `🎲 ${shown.length} ${random.mode === "albums" ? "album" : "artiste"}${shown.length !== 1 ? "s" : ""} au hasard`
+              : `${sorted.length} album${sorted.length !== 1 ? "s" : ""}`}
           </span>
+          {random && <> parmi {filtered.length}</>}
           {activeFilters.length > 0 && <> · {activeFilters.join(" · ")}</>}
           {activeFilters.length > 0 && (
             <button onClick={clearFilters} style={{
@@ -915,7 +952,32 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
             }}>Effacer filtres</button>
           )}
         </div>
+        {random ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ display: "flex", border: "1px solid #262626", borderRadius: 8, overflow: "hidden" }}>
+              {[["albums", "Albums"], ["artists", "Artistes"]].map(([m, l]) => (
+                <button key={m} onClick={() => setRandom({ mode: m, seed: newSeed() })} style={{
+                  background: random.mode === m ? "#f5a623" : "#161616", border: "none",
+                  padding: "6px 10px", color: random.mode === m ? "#0d0d0d" : "#aaa",
+                  fontSize: 12, fontWeight: 600,
+                }}>{l}</button>
+              ))}
+            </div>
+            <button onClick={() => setRandom({ ...random, seed: newSeed() })} title="Nouveau tirage" style={{
+              background: "#161616", border: "1px solid #262626", borderRadius: 8,
+              height: 30, padding: "0 10px", color: "#f5a623", fontSize: 12, fontWeight: 600,
+            }}>🎲 Relancer</button>
+            <button onClick={() => setRandom(null)} aria-label="Quitter le mode aléatoire" title="Revenir à la liste" style={{
+              background: "#161616", border: "1px solid #262626", borderRadius: 8,
+              width: 30, height: 30, color: "#ccc", fontSize: 14, padding: 0,
+            }}>×</button>
+          </div>
+        ) : (
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <button onClick={() => setRandom({ mode: "albums", seed: newSeed() })} title="Piocher 10 albums au hasard" style={{
+            background: "#161616", border: "1px solid #262626", borderRadius: 8,
+            height: 30, padding: "0 10px", color: "#f0ece4", fontSize: 12, fontWeight: 600,
+          }}>🎲 Aléatoire</button>
           <select value={sort.key} onChange={e => changeSort(e.target.value)} aria-label="Trier par" style={{
             background: "#161616", border: "1px solid #262626", borderRadius: 8,
             padding: "6px 8px", color: "#f0ece4", fontSize: 12,
@@ -928,9 +990,10 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
               width: 30, height: 30, color: "#f5a623", fontSize: 14, padding: 0,
             }}>{sort.dir === "asc" ? "↑" : "↓"}</button>
         </div>
+        )}
       </div>
 
-      {sorted.length === 0 && (
+      {shown.length === 0 && (
         <div style={{ textAlign: "center", color: "#555", marginTop: 60, fontSize: 14, lineHeight: 2, whiteSpace: "pre-line" }}>
           {collection.length === 0
             ? "Ta collection est vide.\nCherche des albums pour commencer !"
@@ -938,8 +1001,8 @@ function CollectionTab({ collection, loading, onUpdate, onRemove }) {
         </div>
       )}
 
-      {sorted.map((album, i) => (
-        <div key={album.id} className="card" style={{ animationDelay: cardDelay(i, 30) }}>
+      {shown.map((album, i) => (
+        <div key={random ? `${random.seed}-${album.id}` : album.id} className="card" style={{ animationDelay: cardDelay(i, 30) }}>
           <CollectionCard album={album} onOpen={() => setSelected(album)} />
         </div>
       ))}
