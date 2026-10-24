@@ -69,14 +69,25 @@ function Stars({ value = 0, onChange }) {
   );
 }
 
-function Badge({ label }) {
+function Badge({ label, onRemove }) {
   return (
     <span style={{
+      position: "relative",
       background: "rgba(245,166,35,.14)", color: "#f5a623",
       border: "1px solid rgba(245,166,35,.28)",
       borderRadius: 20, padding: "2px 10px",
       fontSize: 11, fontWeight: 600, letterSpacing: .4, whiteSpace: "nowrap",
-    }}>{label}</span>
+    }}>
+      {label}
+      {onRemove && (
+        <button onClick={onRemove} aria-label={`Retirer le genre ${label}`} title="Retirer ce genre" style={{
+          position: "absolute", top: -7, right: -7,
+          width: 16, height: 16, borderRadius: "50%", padding: 0,
+          background: "#2a2a2a", border: "1px solid #444", color: "#ccc",
+          fontSize: 10, lineHeight: "14px", textAlign: "center",
+        }}>×</button>
+      )}
+    </span>
   );
 }
 
@@ -818,7 +829,8 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
         title: detail.title,
         artist: detail.artist,
         year: detail.year,
-        genres: detail.genres,
+        // Ne pas faire réapparaître les genres retirés à la main
+        genres: album.genres?.length ? album.genres : detail.genres,
         nb_tracks: detail.nb_tracks,
         duration: detail.duration,
         tracks: detail.tracks,
@@ -866,9 +878,11 @@ function CollectionDetailModal({ album, onClose, onUpdate, onRemove }) {
         <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 22, fontWeight: 900 }}>{album.title}</div>
         <div style={{ color: "#f5a623", fontWeight: 600, marginTop: 3 }}>{album.artist}</div>
 
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
           {album.year && <Badge label={album.year} />}
-          {(album.genres || []).map(g => <Badge key={g} label={g} />)}
+          {(album.genres || []).map(g => (
+            <Badge key={g} label={g} onRemove={() => onUpdate({ genres: album.genres.filter(x => x !== g) })} />
+          ))}
           {album.nb_tracks > 0 && <Badge label={`${album.nb_tracks} titres`} />}
         </div>
 
